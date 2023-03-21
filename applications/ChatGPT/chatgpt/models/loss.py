@@ -5,32 +5,7 @@ import torch.nn as nn
 
 from .utils import masked_mean
 
-
-class GPTLMLoss(nn.Module):
-    """
-    GPT Language Model Loss
-    该项损失用于微调SFT模型。
-    SFT模型从一个预训练序列生成模型进行初始化，例如可以是一个GPT模型。
-    """
-
-    def __init__(self):
-        super().__init__()
-        #交叉熵损失函数
-        self.loss = nn.CrossEntropyLoss()
-
-    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        #参数：logits是一个形状为[B,L,D]的张量。表征批次大小、token序列长度、词典大小，值表示token取值的对数似然。
-        #参数：labels是一个形状为[B,L]的张量。表征批次大小、token序列长度，值表示token的真正取值。
-        #因为下一个token的概率分布取决于当前token位置的输出的logits，因此二者相差一个位置，因此需要进行一次错位对齐。
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        #求交叉熵。最小化该损失函数可以最大化真实序列的log-likely-hood。
-        return self.loss(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-
-class PolicyLoss(nn.Module):
-    """
+docs='''
     采用PPO算法最大化期望回报
     本项目对于文本生成任务所定义的强化学习问题是一个多臂老虎机问题（MAD)，整个决策过程只做了一个动作。
         状态：s = prompt
@@ -62,6 +37,33 @@ class PolicyLoss(nn.Module):
         - PPO算法需要两个模型：Actor、critical。
         - Actor模型采用PPO_clip作为损失函数。
         - critical模型采用(V(prompt)-RM(prompt,response))^2作为损失函数。
+'''
+
+class GPTLMLoss(nn.Module):
+    """
+    GPT Language Model Loss
+    该项损失用于微调SFT模型。
+    SFT模型从一个预训练序列生成模型进行初始化，例如可以是一个GPT模型。
+    """
+
+    def __init__(self):
+        super().__init__()
+        #交叉熵损失函数
+        self.loss = nn.CrossEntropyLoss()
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        #参数：logits是一个形状为[B,L,D]的张量。表征批次大小、token序列长度、词典大小，值表示token取值的对数似然。
+        #参数：labels是一个形状为[B,L]的张量。表征批次大小、token序列长度，值表示token的真正取值。
+        #因为下一个token的概率分布取决于当前token位置的输出的logits，因此二者相差一个位置，因此需要进行一次错位对齐。
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        # Flatten the tokens
+        #求交叉熵。最小化该损失函数可以最大化真实序列的log-likely-hood。
+        return self.loss(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+
+class PolicyLoss(nn.Module):
+    """
     Policy Loss for PPO
     """
 
@@ -139,9 +141,18 @@ class ValueLoss(nn.Module):
                 old_values: torch.Tensor,
                 reward: torch.Tensor,
                 action_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        '''
+        参数values: 形状为[B]的张量，B表示批次大小。值表示critical(prompt)。
+        参数old_values：类似values。其值表示critical_old(prompt)。
+        参数reward：形状为[B]。其值主体部分由奖励模型计算RM(prompt,response)，并参杂了一些新旧策略偏移相关的修正项。
+        参数action_mask：间PolicyLoss.forward中对应参数的解释。
+        '''
+        #我们观察到的损失函数与PPO_clip关于策略损失的形式非常相似。
+        #因此我们认为加入clip形式的value_loss本质上约束value、old_value之间的差异不要过大。
+        #起到了约束critical模型更新的速度以及更新的方向、减小损失梯度方差的作用。
         values_clipped = old_values + (values - old_values).clamp(-self.clip_eps, self.clip_eps)
         surr1 = (values_clipped - reward)**2
-        surr2 = (values - reward)**2
+        surr2 = (values - reward)**2 #该项损失函数是遵循我们在docs中推导出的critical模型的范定标准损失项。
         loss = torch.max(surr1, surr2)
         loss = loss.mean()
         return loss
@@ -152,6 +163,7 @@ class PPOPtxActorLoss(nn.Module):
     To Do:
 
     PPO-ptx Actor Loss
+    该项损失函数同时包含强化学习与监督学习损失函数，我猜测是把用户标注数据同时用于监督微调与强化时用到该损失函数。
     """
 
     def __init__(self, policy_clip_eps: float = 0.2, pretrain_coef: float = 0.0, pretrain_loss_fn=GPTLMLoss()) -> None:
@@ -175,10 +187,17 @@ class PPOPtxActorLoss(nn.Module):
 class PairWiseLoss(nn.Module):
     """
     Pairwise Loss for Reward Model
+    该模型用于奖励模型对应的损失函数。
     """
 
     def forward(self, chosen_reward: torch.Tensor, reject_reward: torch.Tensor) -> torch.Tensor:
+        '''
+        参数chosen_reward：被用户认为好的(prompt, chosen_response)被RM模型所打出的分数。即RM(prompt, good_response)。形状为[B]，值表示RM模型输出的分数。
+        参数reject_reword: 被用户认为不好的(prompt, reject_response)被RM模型所打出的分数。即RM(prompt, bad_response)。形状为[B]，值表示RM模型输出的分数。
+        '''
+        #RM模型估算，给出chosen_response与reject_response时，人类选中chosen_response的概率大小。
         probs = torch.sigmoid(chosen_reward - reject_reward)
+        #人类选中chosen_response的概率实际上是1，与模型预测的概率分布的KL散度作为损失函数。
         log_probs = torch.log(probs)
         loss = -log_probs.mean()
         return loss
