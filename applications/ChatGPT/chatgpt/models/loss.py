@@ -75,10 +75,29 @@ class PolicyLoss(nn.Module):
                 old_log_probs: torch.Tensor,
                 advantages: torch.Tensor,
                 action_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        #参数log_probs：一个形状为[B,L]的序列，表示批次、序列长度。值表示token取真实值时在新策略模型下的对数似然。
-        #参数old_log_probs：也是一个形状为[B,L]的序列。值表示token取真实值时在旧策略模型下的对数似然。
-        #action_mask是一个形状为[B,A]的序列，B表示批次、A表示response对应的token序列的长度。值表示response中
+        '''
+            #参数log_probs：一个形状为[B,L]的序列，表示批次、序列长度。值表示token取真实值时在新策略模型下的对数似然。
+            #参数old_log_probs：也是一个形状为[B,L]的序列。值表示token取真实值时在旧策略模型下的对数似然。
+            #参数advantages：优势函数Q(prompt,response) - V(prompt)，形状为[B]，B表示批次。值表示优势函数值。
+            #参数action_mask：是一个形状为[B,A]的序列，B表示批次、A表示response对应的token序列的长度。值表示是否为一个有效的token。
+            #为什么用action_mask?这是因为DL框架接受的都是规整的张量，但是我们知道一个批次不同的样本的prompt与response的长度都是不一致的。因此引入了很多补齐的<PAD>token。
+            #prompt部分采用右对齐，response采用左对齐，因此prompt+response构成的token序列sequence大概率是一个左右两边都是连续的<PAD>，只有中间一部分<token>是有效的。
+            #采用attention_mask标注sequence中那些token位置是否有效，用action_mask只标注response中那些token位置是有效的。
+        '''
+        #下面的算法把生成每个token视作一个action，把文本生成任务当作了多步决策的MDP过程。
+        #这样就不再适用与把文本生成任务当作MAD过程所推导处的损失函数了。
+        #用MAD推导出的损失函数并不能直接应用到MDP定义的动作上。。。
+        #所以这里给出的损失函数可以说是错误的。
         ratio = (log_probs - old_log_probs).exp()
+        #下面的代码计算把response整体的优势当作了构成response每个token的优势函数，这一点其实并不成立。
+        #因为：
+        #      advantage(token_i) 
+        #    = Q(prompt, token_0,token_1,...,token_{i-1},token_i) - V(prompt, token_0,token_1,...,token_{i-1})
+        #   ~= RM(prompt, resopnse) - V(prompt, token_0,token_1,...,token_{i-1})
+        #   != RM(prompt, resopnse) - V(promptd)
+        #其中~=表示期望意义上相等。也就是把RM(prompt, resopnse)当作是Q(prompt, token_0,token_1,...,token_{i-1},token_i)的一次采样估计。
+        #但是即使忽略了这一点，V(prompt, token_0,token_1,...,token_{i-1}) ！= V(prompt)，导致advantage存在着极大的偏差。
+        #下面的实现严重偏离了PPO算法，完全没有任何理论依据，并不是真正的PPO算法，我断言用这个损失函数是无法达到策略优化的目的的。
         surr1 = ratio * advantages
         surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
         loss = -torch.min(surr1, surr2)
@@ -86,6 +105,24 @@ class PolicyLoss(nn.Module):
             loss = masked_mean(loss, action_mask)
         loss = loss.mean()
         return loss
+        #下面是我给出真正的损失函数：
+        '''
+        #计算P(response|prompt;new) / P(response|prompt;old)
+        diff_log_probs = (log_probs-old_log_probs)
+        if action_mask is not None:
+            log_ratio = masked_sum(diff_log_probs, action_mask)
+            ratio = log_ratio.exp()
+        #利用PPO_clip公式计算损失函数.
+        surr1 = ratio*advantages
+        surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
+        loss = -torch.min(surr1, surr2)
+        return loss.mean()
+        #这里给出的算法有很大的缺陷，因为log_ratio可能会非常大，因为存在sum操作，即使每个token位置上log_prob的差异都很小，但是累加后仍会可能非常大。导致ratio严重偏离1。
+        #ratio严重偏离1表示该算法的方差会非常大。
+        #因此这个算法基本上也是不可用的。
+        #但一切的问题都是因为把文本生成过程当作了多臂老虎机MAD造成的，如果看作是多步决策的MDP过程则就不会存在这样的问题。
+        #基于transformer实现的chatGPT就是基于MDP推导的损失函数：https://github.com/lvwerra/trl
+        '''
 
 
 class ValueLoss(nn.Module):
