@@ -34,6 +34,7 @@ class RewardModel(LoRAModule):
             self.value_head = nn.Linear(model.config.n_embd, 1)
 
     def forward(self, sequences: torch.LongTensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        #利用GPT模型为sequences批次中的每一个sequence=prompt+response输出一个标量。
         outputs = self.model(sequences, attention_mask=attention_mask)
         last_hidden_states = outputs['last_hidden_state']
         values = self.value_head(last_hidden_states)[:, :-1]
