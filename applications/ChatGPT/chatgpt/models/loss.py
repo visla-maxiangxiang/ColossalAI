@@ -71,7 +71,7 @@ class PolicyLoss(nn.Module):
         super().__init__()
         self.clip_eps = clip_eps
 
-    #下面的这个计算PPO_clip的算法是有问题的。
+    #下面的这个计算PPO_clip的算法有点不太标准。
     def forward(self,
                 log_probs: torch.Tensor,
                 old_log_probs: torch.Tensor,
@@ -87,19 +87,16 @@ class PolicyLoss(nn.Module):
             #采用attention_mask标注sequence中那些token位置是否有效，用action_mask只标注response中那些token位置是有效的。
         '''
         #下面的算法把生成每个token视作一个action，把文本生成任务当作了多步决策的MDP过程。
-        #这样就不再适用与把文本生成任务当作MAD过程所推导处的损失函数了。
-        #用MAD推导出的损失函数并不能直接应用到MDP定义的动作上。。。
-        #所以这里给出的损失函数可以说是错误的。
+        #用MAD推导出的损失函数并不能直接应用到MDP定义的动作上还是有点难以理解的。
         ratio = (log_probs - old_log_probs).exp()
-        #下面的代码计算把response整体的优势当作了构成response每个token的优势函数，这一点其实并不成立。
-        #因为：
-        #      advantage(token_i) 
-        #    = Q(prompt, token_0,token_1,...,token_{i-1},token_i) - V(prompt, token_0,token_1,...,token_{i-1})
-        #   ~= RM(prompt, resopnse) - V(prompt, token_0,token_1,...,token_{i-1})
-        #   != RM(prompt, resopnse) - V(promptd)
-        #其中~=表示期望意义上相等。也就是把RM(prompt, resopnse)当作是Q(prompt, token_0,token_1,...,token_{i-1},token_i)的一次采样估计。
-        #但是即使忽略了这一点，V(prompt, token_0,token_1,...,token_{i-1}) ！= V(prompt)，导致advantage存在着极大的偏差。
-        #下面的实现严重偏离了PPO算法，完全没有任何理论依据，并不是真正的PPO算法，我断言用这个损失函数是无法达到策略优化的目的的。
+        #下面的代码计算把response整体的优势当作了构成response每个token的优势函数。可以理解成：
+        #      advantage(a_i|s_i) = Q(a_i= token_i, s_i=[prompt,token_0,...,token_{i-1}]) - V(prompt) 【on conditaon : (token_0,token_1,...,token_i) == response[0:i+1] 】
+        #根据我们在doc1中的推导，使用上面的advantage得到的策略梯度也是无偏的。因为prompt是状态s_i=[prompt,token_0,...,token_{i-1}]的母状态，也是一个与策略参数无关的标量。
+        #但问题是我们怎么计算Q(a_i|s_i)呢？
+        #代码直接利用RM(prompt,rsponse)替代Q(a_i,s_i)，可以看作是利用蒙塔卡罗法来对Q(a_i,s_i)进行估算。因为Q(a_i,s_i)的定义就是对后续累积奖励的期望，因此可以采用蒙塔卡罗法估算。
+        #但是却引入了另一个问题，因为这里的蒙塔卡罗法求Q只做了一次采样操作，因此必然存在极大的方差，尤其是response中越靠前的动作Q(a,s)估算的方差越大。
+        #除非策略模型已经接近收敛了，也就是说给定一个prompt，并且给定response的前几个token的条件下，策略模型生成的response的后续token的分布非常集中才能保障下面算法的收敛。
+        #因此下面的代码只能适用于预训练SFT模型进行强化训练，因为预训练SFT模型是已经接近收敛的策略模型了。
         surr1 = ratio * advantages
         surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
         loss = -torch.min(surr1, surr2)
@@ -107,7 +104,7 @@ class PolicyLoss(nn.Module):
             loss = masked_mean(loss, action_mask)
         loss = loss.mean()
         return loss
-        #下面是我给出真正的损失函数：
+        #下面是我给出基于MAD的损失函数：
         '''
         #计算P(response|prompt;new) / P(response|prompt;old)
         diff_log_probs = (log_probs-old_log_probs)
