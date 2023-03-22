@@ -46,9 +46,12 @@ class Critic(LoRAModule):
             num_actions = action_mask.size(1)
             prompt_mask = attention_mask[:, :-num_actions]
             values = values[:, :-num_actions]
+            #利用prompt_mask，只计算与prompt相关的部分，也就是value只与prompt有关，与response无关。
             value = masked_mean(values, prompt_mask, dim=1)
+            #输出的value是一个形状为[B]的张量，表示prompt对应状态的价值即V(prompt)。在Actor-Critical系算法里为critical(state)=critical(prompt)
             return value
 
+        #不采用action_mask时，那么sequeces只包含prompt而不包含response部分。并且批次中所有的prompt的有效序列长度都一致。
         values = values[:, :-1]
         value = values.mean(dim=1)
         return value
